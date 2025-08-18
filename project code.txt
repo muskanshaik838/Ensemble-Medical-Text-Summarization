@@ -1,0 +1,364 @@
+BART Model
+
+
+
+
+!pip install tensorflow
+import tensorflow as tf
+
+if tf.test.gpu_device_name():
+    print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
+else:
+    print("Please install GPU version of TF")
+!pip install datasets
+!pip install genism
+
+import pandas as pd
+from datasets import load_dataset
+from sklearn.model_selection import train_test_split
+import torch
+from transformers import BartTokenizer, BartForConditionalGeneration
+from gensim.models import Word2Vec
+
+train_data=pd.read_csv('EBM/Train.csv')
+test_data=pd.read_csv('EBM/Test.csv')
+val_data=pd.read_csv('EBM/Valid.csv')
+
+def preprocess_data(Data):
+    # You can add more preprocessing steps as needed
+    return Data.str.strip() #Use the .str accessor to apply the strip function to every element in the series
+
+train_data = train_data.apply(preprocess_data) #Use apply on the entire dataframe
+val_data = val_data.apply(preprocess_data)
+test_data = test_data.apply(preprocess_data)
+train_data
+
+tokenizer = BartTokenizer.from_pretrained('facebook/bart-large')
+bart_model = BartForConditionalGeneration.from_pretrained('facebook/bart-large')
+
+entences = [article.split() for articles in train_data['input_text'] for article in articles]
+print('sentences')
+word2vec_model = Word2Vec(sentences, vector_size=100, window=5, min_count=1, workers=4)
+
+def tokenize_function(examples):
+    model_inputs = tokenizer(examples['input_text'], max_length=1024, truncation=True, padding="max_length") # Add padding
+    labels = tokenizer(examples['target_text'], max_length=1024, truncation=True, padding="max_length") # Add padding
+    model_inputs['labels'] = labels['input_ids']
+    return model_inputs
+
+train_tokenized = train_data.apply(lambda x: tokenize_function(x), axis=1)
+val_tokenized = val_data.apply(lambda x: tokenize_function(x), axis=1)
+test_tokenized = test_data.apply(lambda x: tokenize_function(x), axis=1)
+
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir='./bart_results',
+    evaluation_strategy='epoch',
+    learning_rate=5e-5,
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
+    weight_decay=0.01,
+    save_total_limit=2,
+    num_train_epochs=1,
+)
+
+trainer = Seq2SeqTrainer(
+    model=bart_model,
+    args=training_args,
+    train_dataset=train_tokenized,
+    eval_dataset=val_tokenized,
+)
+trainer.train()
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir='./bart_results',
+    evaluation_strategy='epoch',
+    learning_rate=5e-5,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=1,
+    weight_decay=0.01,
+    save_total_limit=2,
+    num_train_epochs=2,
+)
+
+trainer = Seq2SeqTrainer(
+    model=bart_model,
+    args=training_args,
+    train_dataset=train_tokenized,
+    eval_dataset=val_tokenized,
+)trainer.train()
+
+eval_results = trainer.evaluate()
+print(eval_results)
+
+def generate_summary(article,len=50):
+    inputs = tokenizer(article, return_tensors='pt', max_length=1024, truncation=True)
+    # Move inputs to the same device as the model
+    inputs = {k: v.to(bart_model.device) for k, v in inputs.items()}
+    summary_ids = bart_model.generate(inputs['input_ids'], max_length=500,  # Increase this value to allow longer summaries
+        min_length=len,  # Set a reasonable minimum length to avoid very short outputs
+        no_repeat_ngram_size=5,  # To avoid repeating phrases
+        num_beams=4,  # Beam search for better quality summaries
+        early_stopping=True)
+    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+test_summaries = [generate_summary(article) for article in test_data['input_text']]
+
+test_summaries
+
+!pip install rouge_score
+
+from rouge_score import rouge_scorer
+
+scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+
+def calculate_rouge_scores(references, predictions):
+  scores = []
+  for ref, pred in zip(references, predictions):
+    score = scorer.score(ref, pred)
+    scores.append(score)
+  return scores
+
+
+rouge_scores = calculate_rouge_scores(test_data['target_text'].tolist(), test_summaries)
+
+rouge1_scores = [score['rouge1'].fmeasure for score in rouge_scores]
+rouge2_scores = [score['rouge2'].fmeasure for score in rouge_scores]
+rougeL_scores = [score['rougeL'].fmeasure for score in rouge_scores]
+
+average_rouge1 = sum(rouge1_scores) / len(rouge1_scores)
+average_rouge2 = sum(rouge2_scores) / len(rouge2_scores)
+average_rougeL = sum(rougeL_scores) / len(rougeL_scores)
+
+
+print(f"Average Rouge-1: {average_rouge1}")
+print(f"Average Rouge-2: {average_rouge2}")
+print(f"Average Rouge-L: {average_rougeL}")
+
+
+
+
+
+
+
+
+
+
+PEGASUS Model
+
+
+
+
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import PegasusTokenizer, PegasusForConditionalGeneration
+from transformers import Trainer, TrainingArguments
+import random
+
+def load_data(file_path):
+    data = pd.read_csv(file_path)
+    return data['input_text'].tolist(), data['target_text'].tolist()
+
+def few_shot_learning(train_data, num_shots=5):
+    # Randomly sample a few examples from the training data
+    indices = random.sample(range(len(train_data)), num_shots)
+    few_shot_inputs = [train_data[i] for i in indices]
+    return few_shot_inputs
+
+def meta_transfer_learning(source_model, target_model, few_shot_data, optimizer):
+    # Move the model to the GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    target_model.to(device)
+
+    # Initialize the target model with the source model's weights
+    target_model.load_state_dict(source_model.state_dict())
+    
+    # Fine-tune the target model on the few-shot dataset
+    target_model.train()
+    for data in few_shot_data:
+        # Move input tensors to the device
+        input_ids = data['input_ids'].unsqueeze(0).to(device)
+        attention_mask = data['attention_mask'].unsqueeze(0).to(device)
+        labels = data['labels'].unsqueeze(0).to(device)
+
+        # Forward pass
+        outputs = target_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        
+        # Optimizer step and gradient reset
+        optimizer.step()
+        optimizer.zero_grad()
+
+rain_inputs, train_targets = load_data('EBM/Test.csv')
+val_inputs, val_targets = load_data('EBM/Valid.csv')
+test_inputs, test_targets = load_data('EBM/Test.csv')
+
+pegasus_tokenizer = PegasusTokenizer.from_pretrained('google/pegasus-large')
+
+pegasus_train_data = SummarizationDataset(train_inputs, train_targets, pegasus_tokenizer)
+pegasus_val_data = SummarizationDataset(val_inputs, val_targets, pegasus_tokenizer)
+
+pegasus_train_data
+
+pegasus_model = PegasusForConditionalGeneration.from_pretrained('google/pegasus-large')
+
+training_args = TrainingArguments(
+    output_dir='./peagus_results',
+    evaluation_strategy="epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=1,  # You can set this to 1 to reduce memory consumption
+    per_device_eval_batch_size=1,
+    num_train_epochs=10,
+    weight_decay=0.01,
+)
+
+pegasus_trainer = Trainer(
+    model=pegasus_model,
+    args=training_args,
+    train_dataset=pegasus_train_data,
+    eval_dataset=pegasus_val_data,
+)
+
+few_shot_data = few_shot_learning(pegasus_train_data, num_shots=5)
+optimizer = torch.optim.AdamW(pegasus_model.parameters(), lr=2e-5)
+
+meta_transfer_learning(pegasus_model, pegasus_model, few_shot_data, optimizer)
+
+print("Training Pegasus model...")
+pegasus_trainer.train()
+
+print("Evaluating Pegasus model...")
+pegasus_results = pegasus_trainer.evaluate()
+
+pegasus_model.save_pretrained('./pegasus_model')
+
+save_directory = './pegasus_tokenizer'
+
+# Save the tokenizer
+pegasus_tokenizer.save_pretrained(save_directory)
+
+pegasus_results
+
+def generate_lengthy_summary(model, tokenizer, text, max_length=512, min_length=300):
+    inputs = tokenizer(text, return_tensors="pt", max_length=1024, truncation=True)
+    summary_ids = model.generate(
+        inputs['input_ids'],
+        num_beams=4,
+        max_length=max_length,
+        min_length=min_length,
+        early_stopping=True,
+        length_penalty=1.5,  # Encourages longer summaries
+        no_repeat_ngram_size=2  # Prevents repetition of phrases
+    )
+    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+import torch
+from torch.utils.data import Dataset
+from transformers import PegasusTokenizer, PegasusForConditionalGeneration, Trainer, TrainingArguments
+import pandas as pd
+
+# Load the previously saved Pegasus model and tokenizer
+model_path = './pegasus_model'
+pegasus_tokenizer= PegasusTokenizer.from_pretrained('./pegasus_tokenizer')
+pegasus_model = PegasusForConditionalGeneration.from_pretrained(model_path)
+
+!pip install evaluate
+import evaluate
+
+rouge = evaluate.load('rouge')
+bleu = evaluate.load('bleu')
+
+# Prepare references and predictions as strings for BLEU and ROUGE metrics
+references = test_targets  # Use the original reference texts
+predictions = generated_summaries  # Use the generated summaries as strings
+
+# Compute ROUGE scores
+rouge_scores = rouge.compute(predictions=predictions, references=references, use_stemmer=True)
+print("ROUGE scores:", rouge_scores)
+
+# For BLEU, the references need to be a list of lists of strings
+bleu_references = [[ref] for ref in references]
+
+# Compute BLEU scores
+bleu_scores = bleu.compute(predictions=predictions, references=bleu_references)
+print("BLEU scores:", bleu_scores)
+
+
+
+
+
+Final Evalution
+
+import matplotlib.pyplot as plt
+import numpy as np
+from rouge_score import rouge_scorer
+from nltk.translate.bleu_score import sentence_bleu
+from sentence_transformers import SentenceTransformer, util
+
+# Example text and summaries
+original_text = """Hypertension, also known as high blood pressure, is a medical condition in which the force of the blood against the artery walls is consistently too high. It is often called the "silent killer" because it typically has no symptoms but can cause serious health issues such as stroke, heart attack, and kidney damage. Risk factors include age, obesity, sedentary lifestyle, excessive salt intake, and genetics. Treatment includes lifestyle modifications such as a healthy diet, regular exercise, reducing salt intake, and in some cases, antihypertensive medications to control blood pressure levels."""
+
+
+pegasus_summary = "Hypertension is a condition where blood pressure is consistently high, increasing risks of stroke, heart attack, and kidney issues. It is managed through diet, exercise, and medication."
+
+bart_summary = "High blood pressure, or hypertension, is a health risk with no obvious symptoms but can cause severe complications. It can be managed with lifestyle changes and medications."
+
+ensemble_summary = pegasus_summary + " " + bart_summary
+
+# Initialize models for similarity
+similarity_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Function to calculate ROUGE scores
+def calculate_rouge(reference, summary):
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    scores = scorer.score(reference, summary)
+    return scores
+
+# Calculate metrics
+rouge_pegasus = calculate_rouge(original_text, pegasus_summary)
+rouge_bart = calculate_rouge(original_text, bart_summary)
+rouge_ensemble = calculate_rouge(original_text, ensemble_summary)
+
+bleu_pegasus = sentence_bleu([original_text.split()], pegasus_summary.split())
+bleu_bart = sentence_bleu([original_text.split()], bart_summary.split())
+bleu_ensemble = sentence_bleu([original_text.split()], ensemble_summary.split())
+
+# Cosine similarity
+def calculate_similarity(summary1, summary2):
+    embeddings = similarity_model.encode([summary1, summary2], convert_to_tensor=True)
+    score = util.pytorch_cos_sim(embeddings[0], embeddings[1])
+    return score.item()
+
+similarity_score = calculate_similarity(pegasus_summary, bart_summary)
+
+# Summary length ratio
+length_ratio_pegasus = len(pegasus_summary) / len(original_text)
+length_ratio_bart = len(bart_summary) / len(original_text)
+length_ratio_ensemble = len(ensemble_summary) / len(original_text)
+
+# Graph Plotting
+labels = ['ROUGE-1', 'ROUGE-2', 'ROUGE-L', 'BLEU', 'Length Ratio']
+pegasus_scores = [rouge_pegasus['rouge1'].fmeasure, rouge_pegasus['rouge2'].fmeasure, rouge_pegasus['rougeL'].fmeasure, bleu_pegasus, length_ratio_pegasus]
+bart_scores = [rouge_bart['rouge1'].fmeasure, rouge_bart['rouge2'].fmeasure, rouge_bart['rougeL'].fmeasure, bleu_bart, length_ratio_bart]
+ensemble_scores = [rouge_ensemble['rouge1'].fmeasure, rouge_ensemble['rouge2'].fmeasure, rouge_ensemble['rougeL'].fmeasure, bleu_ensemble, length_ratio_ensemble]
+
+x = np.arange(len(labels))  # Label locations
+width = 0.25  # Bar width
+
+fig, ax = plt.subplots(figsize=(10, 6))
+rects1 = ax.bar(x - width, pegasus_scores, width, label='PEGASUS', color='blue')
+rects2 = ax.bar(x, bart_scores, width, label='BART', color='green')
+rects3 = ax.bar(x + width, ensemble_scores, width, label='Ensemble', color='red')
+
+ax.set_ylabel('Scores')
+ax.set_title('Summarization Metrics (PEGASUS vs. BART vs. Ensemble)')
+ax.set_xticks(x)
+ax.set_xticklabels(labels)
+ax.legend()
+
+plt.show()
+
+
