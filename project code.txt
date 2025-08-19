@@ -1,4 +1,4 @@
-BART Model
+#########BART Model
 
 
 
@@ -145,7 +145,7 @@ print(f"Average Rouge-L: {average_rougeL}")
 
 
 
-PEGASUS Model
+#########PEGASUS Model
 
 
 
@@ -360,5 +360,6 @@ ax.set_xticklabels(labels)
 ax.legend()
 
 plt.show()
+
 
 
